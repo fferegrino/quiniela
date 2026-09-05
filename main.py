@@ -7,6 +7,7 @@ from openai import OpenAI
 load_dotenv()
 
 MODEL = "gpt-4o-mini"
+SYSTEM_PROMPT = """Eres un asistente experto en fútbol mexicano especializado en ayudar a llenar quinielas de la Liga MX."""
 
 
 def main() -> None:
@@ -17,7 +18,7 @@ def main() -> None:
 
     client = OpenAI(api_key=api_key)
     messages: list[dict[str, str]] = [
-        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "system", "content": SYSTEM_PROMPT},
     ]
 
     print("Chat with OpenAI (type 'quit' or 'exit' to leave)\n")
