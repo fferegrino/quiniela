@@ -4,6 +4,7 @@ import os
 from typing import Any
 
 import httpx2
+import mlflow
 from dotenv import load_dotenv
 from mcp import Client, MCPError
 from mcp.types import CallToolResult, TextContent, Tool
@@ -13,6 +14,8 @@ from openai.types.chat import (
     ChatCompletionMessageParam,
     ChatCompletionToolParam,
 )
+
+mlflow.openai.autolog()
 
 load_dotenv()
 

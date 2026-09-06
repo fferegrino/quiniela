@@ -11,3 +11,7 @@ wheels/
 
 # Secrets
 .env
+
+# MLflow
+mlruns/
+mlflow.db
