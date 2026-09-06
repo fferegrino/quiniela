@@ -29,7 +29,7 @@ from serpapi_news import (
     search_matches_news,
     search_teams_news,
 )
-from team_aliases import resolve_team_name, resolve_team_names
+from team_aliases import resolve_team_name, resolve_team_names, resolve_team_slug
 from tool_cache import cache_key, mcp_cache
 
 mlflow.openai.autolog()
@@ -158,8 +158,23 @@ def resolve_profile(name: str) -> tuple[str, str, ReasoningEffort]:
     return key, profile["model"], profile["reasoning_effort"]  # type: ignore[return-value]
 
 
+# Argument keys that carry Liga MX team identifiers for MCP tools.
+_MCP_TEAM_KEYS = frozenset(
+    {
+        "slug",
+        "slug_a",
+        "slug_b",
+        "team",
+        "team_a",
+        "team_b",
+        "home",
+        "away",
+    }
+)
+
+
 def resolve_team_args(arguments: dict[str, Any]) -> dict[str, Any]:
-    """Normalize known Liga MX team aliases inside tool argument values."""
+    """Normalize known Liga MX aliases to display names (for news queries)."""
 
     def _resolve_value(value: Any) -> Any:
         if isinstance(value, str):
@@ -171,6 +186,21 @@ def resolve_team_args(arguments: dict[str, Any]) -> dict[str, Any]:
         return value
 
     return {key: _resolve_value(value) for key, value in arguments.items()}
+
+
+def resolve_mcp_team_args(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Normalize team fields in MCP args to Liga MX API slugs (e.g. america, cruz-azul)."""
+
+    def _resolve_value(key: str, value: Any) -> Any:
+        if isinstance(value, str) and (key in _MCP_TEAM_KEYS or key.endswith("_slug")):
+            return resolve_team_slug(value)
+        if isinstance(value, list):
+            return [_resolve_value(key, item) for item in value]
+        if isinstance(value, dict):
+            return {child_key: _resolve_value(child_key, item) for child_key, item in value.items()}
+        return value
+
+    return {key: _resolve_value(key, value) for key, value in arguments.items()}
 
 
 def mcp_tools_to_openai(tools: list[Tool]) -> list[FunctionToolParam]:
@@ -307,13 +337,14 @@ async def run_tool_call(
     if not isinstance(arguments, dict):
         return f"Error: tool arguments must be a JSON object, got {type(arguments).__name__}.", None
 
-    arguments = resolve_team_args(arguments)
-
     if name == SEARCH_TEAM_NEWS_TOOL_NAME:
+        arguments = resolve_team_args(arguments)
         try:
             return await asyncio.to_thread(_run_search_team_news, arguments), arguments
         except (SerpApiError, KeyError, OSError, httpx.HTTPError, TimeoutError) as exc:
             return f"Error calling tool {name}: {exc}", arguments
+
+    arguments = resolve_mcp_team_args(arguments)
 
     key = cache_key("mcp", {"name": name, "arguments": arguments})
     cached = mcp_cache.get(key)
