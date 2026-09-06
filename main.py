@@ -6,8 +6,13 @@ from typing import Any
 import httpx2
 from dotenv import load_dotenv
 from mcp import Client, MCPError
-from mcp.types import TextContent
+from mcp.types import CallToolResult, TextContent, Tool
 from openai import AsyncOpenAI, OpenAIError
+from openai.types.chat import (
+    ChatCompletionMessageFunctionToolCall,
+    ChatCompletionMessageParam,
+    ChatCompletionToolParam,
+)
 
 load_dotenv()
 
@@ -19,8 +24,9 @@ BASE_SYSTEM_PROMPT = (
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 
-def mcp_tools_to_openai(tools: list[Any]) -> list[dict[str, Any]]:
-    openai_tools: list[dict[str, Any]] = []
+def mcp_tools_to_openai(tools: list[Tool]) -> list[ChatCompletionToolParam]:
+    """Convert MCP tool definitions into OpenAI Chat Completions tool schemas."""
+    openai_tools: list[ChatCompletionToolParam] = []
     for tool in tools:
         openai_tools.append(
             {
@@ -35,7 +41,8 @@ def mcp_tools_to_openai(tools: list[Any]) -> list[dict[str, Any]]:
     return openai_tools
 
 
-def tool_result_text(result: Any) -> str:
+def tool_result_text(result: CallToolResult) -> str:
+    """Serialize an MCP tool result into text for an OpenAI tool message."""
     if result.structured_content is not None:
         return json.dumps(result.structured_content, ensure_ascii=False)
 
@@ -46,11 +53,20 @@ def tool_result_text(result: Any) -> str:
     return json.dumps({"is_error": bool(result.is_error)}, ensure_ascii=False)
 
 
-async def run_tool_call(mcp_client: Client, tool_call: Any) -> str:
+async def run_tool_call(
+    mcp_client: Client,
+    tool_call: ChatCompletionMessageFunctionToolCall,
+) -> str:
+    """Execute one OpenAI function tool call against the MCP server.
+
+    Returns a string suitable for a Chat Completions ``role=tool`` message.
+    Invalid arguments and transport/tool failures are returned as error text
+    so the model can recover instead of aborting the turn.
+    """
     name = tool_call.function.name
     raw_arguments = tool_call.function.arguments or "{}"
     try:
-        arguments = json.loads(raw_arguments)
+        arguments: Any = json.loads(raw_arguments)
     except json.JSONDecodeError as exc:
         return f"Error: invalid JSON arguments for {name}: {exc}. Arguments were: {raw_arguments}"
 
@@ -71,10 +87,15 @@ async def run_tool_call(mcp_client: Client, tool_call: Any) -> str:
 async def chat_turn(
     llm_client: AsyncOpenAI,
     mcp_client: Client,
-    messages: list[dict[str, Any]],
-    openai_tools: list[dict[str, Any]],
+    messages: list[ChatCompletionMessageParam],
+    openai_tools: list[ChatCompletionToolParam],
 ) -> str | None:
-    """Run one user turn through the tool loop. Returns the assistant reply, or None on failure."""
+    """Run one user turn, including any MCP tool-calling rounds.
+
+    Mutates ``messages`` in place. On success, appends the final assistant
+    reply and returns its text. On API failure or too many tool rounds, rolls
+    back messages added during this turn and returns ``None``.
+    """
     turn_start = len(messages)
 
     for _ in range(MAX_TOOL_ROUNDS):
@@ -98,6 +119,7 @@ async def chat_turn(
             messages.append({"role": "assistant", "content": assistant_message})
             return assistant_message
 
+        function_calls = [tc for tc in tool_calls if isinstance(tc, ChatCompletionMessageFunctionToolCall)]
         messages.append(
             {
                 "role": "assistant",
@@ -111,12 +133,12 @@ async def chat_turn(
                             "arguments": tc.function.arguments,
                         },
                     }
-                    for tc in tool_calls
+                    for tc in function_calls
                 ],
             }
         )
 
-        for tool_call in tool_calls:
+        for tool_call in function_calls:
             text_result = await run_tool_call(mcp_client, tool_call)
             messages.append(
                 {
@@ -132,6 +154,7 @@ async def chat_turn(
 
 
 async def main() -> None:
+    """Connect to the Liga MX MCP server and run the interactive chat loop."""
     async with Client(os.environ["LIGA_MX_MCP_URL"]) as mcp_client:
         list_tools = await mcp_client.list_tools()
         openai_tools = mcp_tools_to_openai(list_tools.tools)
@@ -143,7 +166,7 @@ async def main() -> None:
         print(f">>> System prompt: {system_prompt}")
 
         llm_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-        messages: list[dict[str, Any]] = [
+        messages: list[ChatCompletionMessageParam] = [
             {"role": "system", "content": system_prompt},
         ]
 
