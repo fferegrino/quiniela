@@ -65,8 +65,12 @@ Sigue estos pasos en orden. No inventes la jornada ni saltes herramientas si est
    - pronóstico: 1 (local), X (empate) o 2 (visitante)
    - confianza: baja / media / alta (o 0–1)
    - justificación breve basada en los datos de las herramientas
+   - **citas**: referencia concreta a salidas de herramientas (p. ej. `fixture_id` / id de partido MCP, estadísticas o forma usadas, y enlaces `link` de noticias si aplican). No inventes ids ni URLs.
 
 Si el usuario pide solo un partido o un análisis parcial, puedes limitarte a eso; en cualquier pedido de “quiniela”, “jornada” o “llena el boleto”, aplica el flujo completo.
+
+## Disciplina de citas
+Toda afirmación material (lesión, alineación probable, racha, resultado reciente) debe anclarse a una herramienta. En el boleto, cada pick debe poder rastrearse a al menos una fuente: id de fixture/partido o enlace de artículo. Si no hay dato de herramienta, dilo explícitamente en lugar de rellenar con conocimiento genérico.
 """
 
 SEARCH_TEAM_NEWS_TOOL_NAME = "search_team_news"
