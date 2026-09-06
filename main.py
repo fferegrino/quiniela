@@ -10,11 +10,8 @@ from dotenv import load_dotenv
 from mcp import Client, MCPError
 from mcp.types import CallToolResult, TextContent, Tool
 from openai import AsyncOpenAI, OpenAIError
-from openai.types.chat import (
-    ChatCompletionMessageFunctionToolCall,
-    ChatCompletionMessageParam,
-    ChatCompletionToolParam,
-)
+from openai.types.responses import FunctionToolParam, ResponseFunctionToolCall
+from openai.types.responses.response_input_param import ResponseInputParam
 
 from serpapi_news import (
     SerpApiError,
@@ -36,69 +33,67 @@ Puedes consultar noticias recientes de equipos con la herramienta search_team_ne
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 SEARCH_TEAM_NEWS_TOOL_NAME = "search_team_news"
-SEARCH_TEAM_NEWS_TOOL: ChatCompletionToolParam = {
+SEARCH_TEAM_NEWS_TOOL: FunctionToolParam = {
     "type": "function",
-    "function": {
-        "name": SEARCH_TEAM_NEWS_TOOL_NAME,
-        "description": (
-            "Busca noticias recientes de equipos de la Liga MX / fútbol mexicano en Google News (SerpApi). "
-            "Úsala para lesiones, forma reciente, rumores, alineaciones o cobertura de prensa que ayude a armar quinielas. "
-            "Pasa uno o más nombres de clubes (por ejemplo: América, Cruz Azul, Guadalajara)."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "teams": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "minItems": 1,
-                    "description": "Nombres de clubes a buscar, por ejemplo: ['América', 'Cruz Azul'].",
-                },
-                "when": {
-                    "type": "string",
-                    "enum": ["1d", "7d", "30d", "1y"],
-                    "description": "Ventana de antigüedad de las noticias. Por defecto: 7d.",
-                },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 10,
-                    "description": "Máximo de artículos por equipo (1-10). Por defecto: 5.",
-                },
-                "read_bodies": {
-                    "type": "boolean",
-                    "description": (
-                        "Si es true, también descarga y extrae el texto de los primeros enlaces. "
-                        "Es más lento; úsalo solo cuando los snippets no basten."
-                    ),
-                },
+    "name": SEARCH_TEAM_NEWS_TOOL_NAME,
+    "description": (
+        "Busca noticias recientes de equipos de la Liga MX / fútbol mexicano en Google News (SerpApi). "
+        "Úsala para lesiones, forma reciente, rumores, alineaciones o cobertura de prensa que ayude a armar quinielas. "
+        "Pasa uno o más nombres de clubes (por ejemplo: América, Cruz Azul, Guadalajara)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "teams": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "description": "Nombres de clubes a buscar, por ejemplo: ['América', 'Cruz Azul'].",
             },
-            "required": ["teams"],
-            "additionalProperties": False,
+            "when": {
+                "type": "string",
+                "enum": ["1d", "7d", "30d", "1y"],
+                "description": "Ventana de antigüedad de las noticias. Por defecto: 7d.",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "description": "Máximo de artículos por equipo (1-10). Por defecto: 5.",
+            },
+            "read_bodies": {
+                "type": "boolean",
+                "description": (
+                    "Si es true, también descarga y extrae el texto de los primeros enlaces. "
+                    "Es más lento; úsalo solo cuando los snippets no basten."
+                ),
+            },
         },
+        "required": ["teams"],
+        "additionalProperties": False,
     },
+    "strict": False,
 }
 
 
-def mcp_tools_to_openai(tools: list[Tool]) -> list[ChatCompletionToolParam]:
-    """Convert MCP tool definitions into OpenAI Chat Completions tool schemas."""
-    openai_tools: list[ChatCompletionToolParam] = []
+def mcp_tools_to_openai(tools: list[Tool]) -> list[FunctionToolParam]:
+    """Convert MCP tool definitions into OpenAI Responses API function tool schemas."""
+    openai_tools: list[FunctionToolParam] = []
     for tool in tools:
         openai_tools.append(
             {
                 "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description or tool.name,
-                    "parameters": tool.input_schema or {"type": "object", "properties": {}},
-                },
+                "name": tool.name,
+                "description": tool.description or tool.name,
+                "parameters": tool.input_schema or {"type": "object", "properties": {}},
+                "strict": False,
             }
         )
     return openai_tools
 
 
 def tool_result_text(result: CallToolResult) -> str:
-    """Serialize an MCP tool result into text for an OpenAI tool message."""
+    """Serialize an MCP tool result into text for a function_call_output item."""
     if result.structured_content is not None:
         return json.dumps(result.structured_content, ensure_ascii=False)
 
@@ -163,16 +158,16 @@ def _run_search_team_news(arguments: dict[str, Any]) -> str:
 
 async def run_tool_call(
     mcp_client: Client,
-    tool_call: ChatCompletionMessageFunctionToolCall,
+    tool_call: ResponseFunctionToolCall,
 ) -> str:
-    """Execute one OpenAI function tool call (local SerpApi news or MCP).
+    """Execute one Responses API function call (local SerpApi news or MCP).
 
-    Returns a string suitable for a Chat Completions ``role=tool`` message.
-    Invalid arguments and transport/tool failures are returned as error text
-    so the model can recover instead of aborting the turn.
+    Returns a string suitable for a ``function_call_output`` item. Invalid
+    arguments and transport/tool failures are returned as error text so the
+    model can recover instead of aborting the turn.
     """
-    name = tool_call.function.name
-    raw_arguments = tool_call.function.arguments or "{}"
+    name = tool_call.name
+    raw_arguments = tool_call.arguments or "{}"
     try:
         arguments: Any = json.loads(raw_arguments)
     except json.JSONDecodeError as exc:
@@ -201,70 +196,53 @@ async def run_tool_call(
 async def chat_turn(
     llm_client: AsyncOpenAI,
     mcp_client: Client,
-    messages: list[ChatCompletionMessageParam],
-    openai_tools: list[ChatCompletionToolParam],
-) -> str | None:
-    """Run one user turn, including any local/MCP tool-calling rounds.
+    instructions: str,
+    openai_tools: list[FunctionToolParam],
+    user_input: str,
+    previous_response_id: str | None,
+) -> tuple[str | None, str | None]:
+    """Run one user turn via the Responses API, including tool-calling rounds.
 
-    Mutates ``messages`` in place. On success, appends the final assistant
-    reply and returns its text. On API failure or too many tool rounds, rolls
-    back messages added during this turn and returns ``None``.
+    Uses ``previous_response_id`` to chain conversation state. Returns
+    ``(assistant_text, latest_response_id)``. On API failure or too many tool
+    rounds, returns ``(None, previous_response_id)``.
     """
-    turn_start = len(messages)
+    input_items: ResponseInputParam = [{"role": "user", "content": user_input}]
+    response_id = previous_response_id
 
     for _ in range(MAX_TOOL_ROUNDS):
         try:
-            response = await llm_client.chat.completions.create(
+            response = await llm_client.responses.create(
                 model=MODEL,
-                messages=messages,
+                instructions=instructions,
+                input=input_items,
                 tools=openai_tools,
                 tool_choice="auto",
+                previous_response_id=response_id,
             )
         except OpenAIError as exc:
             print(f"Error: {exc}")
-            del messages[turn_start:]
-            return None
+            return None, previous_response_id
 
-        choice = response.choices[0].message
-        tool_calls = choice.tool_calls
+        response_id = response.id
+        function_calls = [item for item in response.output if isinstance(item, ResponseFunctionToolCall)]
 
-        if not tool_calls:
-            assistant_message = choice.content or ""
-            messages.append({"role": "assistant", "content": assistant_message})
-            return assistant_message
+        if not function_calls:
+            return response.output_text or "", response_id
 
-        function_calls = [tc for tc in tool_calls if isinstance(tc, ChatCompletionMessageFunctionToolCall)]
-        messages.append(
-            {
-                "role": "assistant",
-                "content": choice.content,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                    for tc in function_calls
-                ],
-            }
-        )
-
+        input_items = []
         for tool_call in function_calls:
             text_result = await run_tool_call(mcp_client, tool_call)
-            messages.append(
+            input_items.append(
                 {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": text_result,
+                    "type": "function_call_output",
+                    "call_id": tool_call.call_id,
+                    "output": text_result,
                 }
             )
 
     print(f"Error: exceeded {MAX_TOOL_ROUNDS} tool rounds without a final answer.")
-    del messages[turn_start:]
-    return None
+    return None, previous_response_id
 
 
 async def main() -> None:
@@ -282,9 +260,7 @@ async def main() -> None:
         print(f">>> MCP tools: {', '.join(tool.name for tool in list_tools.tools) or '(none)'}")
 
         llm_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-        messages: list[ChatCompletionMessageParam] = [
-            {"role": "system", "content": system_prompt},
-        ]
+        previous_response_id: str | None = None
 
         print("Chat with OpenAI (type 'quit' or 'exit' to leave)\n")
 
@@ -302,8 +278,14 @@ async def main() -> None:
                 print("Bye!")
                 break
 
-            messages.append({"role": "user", "content": user_input})
-            assistant_message = await chat_turn(llm_client, mcp_client, messages, openai_tools)
+            assistant_message, previous_response_id = await chat_turn(
+                llm_client,
+                mcp_client,
+                system_prompt,
+                openai_tools,
+                user_input,
+                previous_response_id,
+            )
             if assistant_message is None:
                 continue
 
