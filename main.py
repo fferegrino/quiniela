@@ -1,9 +1,11 @@
 import asyncio
+import json
 import os
 from typing import Any
 
 from dotenv import load_dotenv
 from mcp import Client
+from mcp.types import TextContent
 from openai import AsyncOpenAI, OpenAIError
 
 load_dotenv()
@@ -29,6 +31,29 @@ def mcp_tools_to_openai(tools: list[Any]) -> list[dict[str, Any]]:
             }
         )
     return openai_tools
+
+
+async def run_tool_call(mcp_client, tool_call):
+    name = tool_call.function.name
+    try:
+        arguments = json.loads(tool_call.function.arguments or "{}")
+    except json.JSONDecodeError:
+        arguments = {}
+
+    result = await mcp_client.call_tool(name, arguments)
+
+    return result
+
+
+def tool_result_text(result: Any) -> str:
+    if result.structured_content is not None:
+        return json.dumps(result.structured_content, ensure_ascii=False)
+
+    texts = [block.text for block in result.content if isinstance(block, TextContent) and block.text]
+    if texts:
+        return "\n".join(texts)
+
+    return json.dumps({"is_error": bool(result.is_error)}, ensure_ascii=False)
 
 
 async def main() -> None:
@@ -66,24 +91,63 @@ async def main() -> None:
 
             messages.append({"role": "user", "content": user_input})
 
-            try:
-                response = await llm_client.chat.completions.create(
-                    model=MODEL,
-                    messages=messages,
-                    tools=openai_tools,
-                    tool_choice="auto",
-                )
-            except OpenAIError as exc:
-                print(f"Error: {exc}")
-                messages.pop()
-                continue
+            while True:
+                # This is the tool calling loop
 
-            assistant_message = response.choices[0].message.content or ""
-            tool_calls = response.choices[0].message.tool_calls
+                try:
+                    response = await llm_client.chat.completions.create(
+                        model=MODEL,
+                        messages=messages,
+                        tools=openai_tools,
+                        tool_choice="auto",
+                    )
+                except OpenAIError as exc:
+                    print(f"Error: {exc}")
+                    messages.pop()
+                    continue
+
+                choice = response.choices[0].message
+                assistant_message = choice.content or ""
+                tool_calls = choice.tool_calls
+
+                if tool_calls:
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": choice.content,
+                            "tool_calls": [
+                                {
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments,
+                                    },
+                                }
+                                for tc in choice.tool_calls
+                            ],
+                        }
+                    )
+                    tool_results = []
+                    for tool_call in tool_calls:
+                        result = await run_tool_call(mcp_client, tool_call)
+                        text_result = tool_result_text(result)
+
+                        tool_results.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": text_result,
+                            }
+                        )
+                    messages.extend(tool_results)
+                    # We call the LLM again with the tool results
+                    continue
+                else:
+                    break
 
             messages.append({"role": "assistant", "content": assistant_message})
             print(f"\nAssistant: {assistant_message}\n")
-            print(f">>> Tool calls: {tool_calls}")
 
 
 if __name__ == "__main__":
