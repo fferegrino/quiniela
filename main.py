@@ -1,7 +1,7 @@
 import asyncio
 import json
 import os
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import httpx2
@@ -23,8 +23,28 @@ mlflow.openai.autolog()
 
 load_dotenv()
 
-MODEL = "gpt-4o-mini"
-MAX_TOOL_ROUNDS = 8
+ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+
+# Both profiles use the Responses API (required for tools + reasoning on gpt-5.6).
+# Switch with QUINIELA_PROFILE=mini|reasoning, or type /mini or /reasoning in chat.
+PROFILES: dict[str, dict[str, str]] = {
+    "mini": {"model": "gpt-5-mini", "reasoning_effort": "minimal"},
+    "reasoning": {"model": "gpt-5.6", "reasoning_effort": "high"},
+}
+DEFAULT_PROFILE = os.getenv("QUINIELA_PROFILE", "reasoning")
+MAX_TOOL_ROUNDS = 10
+
+
+def resolve_profile(name: str) -> tuple[str, str, ReasoningEffort]:
+    """Return (profile_name, model, reasoning_effort) for a known profile key."""
+    key = name.strip().lower()
+    if key not in PROFILES:
+        known = ", ".join(sorted(PROFILES))
+        raise ValueError(f"Unknown profile {name!r}. Choose one of: {known}")
+    profile = PROFILES[key]
+    return key, profile["model"], profile["reasoning_effort"]  # type: ignore[return-value]
+
+
 BASE_SYSTEM_PROMPT = """Eres un asistente experto en fútbol mexicano especializado en ayudar a llenar quinielas de la Liga MX, conociendo la información de los equipos, sus jugadores, sus partidos, sus resultados, sus estadísticas, sus noticias, sus rumores, sus alineaciones, sus lesiones, etc.
 
 Usa información de noticias recientes de los equipos para llenar quinielas, como lesiones, rumores, alineaciones, etc.
@@ -200,12 +220,14 @@ async def chat_turn(
     openai_tools: list[FunctionToolParam],
     user_input: str,
     previous_response_id: str | None,
+    model: str,
+    reasoning_effort: ReasoningEffort,
 ) -> tuple[str | None, str | None]:
     """Run one user turn via the Responses API, including tool-calling rounds.
 
-    Uses ``previous_response_id`` to chain conversation state. Returns
-    ``(assistant_text, latest_response_id)``. On API failure or too many tool
-    rounds, returns ``(None, previous_response_id)``.
+    Uses ``previous_response_id`` so reasoning items stay available across
+    function calls. Returns ``(assistant_text, latest_response_id)``. On API
+    failure or too many tool rounds, returns ``(None, previous_response_id)``.
     """
     input_items: ResponseInputParam = [{"role": "user", "content": user_input}]
     response_id = previous_response_id
@@ -213,11 +235,12 @@ async def chat_turn(
     for _ in range(MAX_TOOL_ROUNDS):
         try:
             response = await llm_client.responses.create(
-                model=MODEL,
+                model=model,
                 instructions=instructions,
                 input=input_items,
                 tools=openai_tools,
                 tool_choice="auto",
+                reasoning={"effort": reasoning_effort},
                 previous_response_id=response_id,
             )
         except OpenAIError as exc:
@@ -255,14 +278,17 @@ async def main() -> None:
         else:
             system_prompt = BASE_SYSTEM_PROMPT
 
+        profile_name, model, reasoning_effort = resolve_profile(DEFAULT_PROFILE)
+
         print(f">>> System prompt: {system_prompt}")
+        print(f">>> Profile: {profile_name} → {model} (reasoning_effort={reasoning_effort})")
         print(f">>> Local tools: {SEARCH_TEAM_NEWS_TOOL_NAME}")
         print(f">>> MCP tools: {', '.join(tool.name for tool in list_tools.tools) or '(none)'}")
 
         llm_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
         previous_response_id: str | None = None
 
-        print("Chat with OpenAI (type 'quit' or 'exit' to leave)\n")
+        print("Chat with OpenAI (type 'quit'/'exit', or '/mini' / '/reasoning' to switch)\n")
 
         while True:
             try:
@@ -278,6 +304,12 @@ async def main() -> None:
                 print("Bye!")
                 break
 
+            if user_input.lower() in ("/mini", "/reasoning"):
+                profile_name, model, reasoning_effort = resolve_profile(user_input[1:])
+                previous_response_id = None  # model/effort change breaks response chaining
+                print(f"Switched to {profile_name} → {model} (reasoning_effort={reasoning_effort})")
+                continue
+
             assistant_message, previous_response_id = await chat_turn(
                 llm_client,
                 mcp_client,
@@ -285,6 +317,8 @@ async def main() -> None:
                 openai_tools,
                 user_input,
                 previous_response_id,
+                model,
+                reasoning_effort,
             )
             if assistant_message is None:
                 continue
