@@ -1,8 +1,8 @@
 [project]
 name = "quiniela-agentica"
 version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
+description = "Un asistente experto en fútbol mexicano especializado en ayudar a llenar quinielas de la Liga MX."
+readme = "readme.md"
 requires-python = ">=3.10"
 dependencies = [
     "openai>=1.0.0",
