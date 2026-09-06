@@ -30,6 +30,7 @@ from serpapi_news import (
     search_teams_news,
 )
 from team_aliases import resolve_team_name, resolve_team_names
+from tool_cache import cache_key, mcp_cache
 
 mlflow.openai.autolog()
 load_dotenv()
@@ -291,6 +292,11 @@ async def run_tool_call(
         except (SerpApiError, KeyError, OSError, httpx.HTTPError, TimeoutError) as exc:
             return f"Error calling tool {name}: {exc}", arguments
 
+    key = cache_key("mcp", {"name": name, "arguments": arguments})
+    cached = mcp_cache.get(key)
+    if cached is not None:
+        return cached, arguments
+
     try:
         result = await mcp_client.call_tool(name, arguments)
     except (MCPError, httpx2.HTTPError, OSError, TimeoutError) as exc:
@@ -299,6 +305,7 @@ async def run_tool_call(
     text = tool_result_text(result)
     if result.is_error:
         return f"Error from tool {name}: {text}", arguments
+    mcp_cache.set(key, text)
     return text, arguments
 
 

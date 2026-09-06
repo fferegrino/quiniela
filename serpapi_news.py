@@ -16,6 +16,7 @@ import httpx
 from dotenv import load_dotenv
 
 from team_aliases import resolve_team_name
+from tool_cache import cache_key, news_cache
 
 load_dotenv()
 
@@ -227,6 +228,14 @@ def search_team_news(
     Returns ``(articles, raw_response)``.
     """
     team = resolve_team_name(team)
+    key = cache_key(
+        "team_news",
+        {"team": team, "when": when, "gl": gl, "hl": hl, "limit": limit, "focus": focus},
+    )
+    cached = news_cache.get(key)
+    if cached is not None:
+        return cached
+
     params: dict[str, Any] = {
         "engine": "google",
         "tbm": "nws",
@@ -246,7 +255,9 @@ def search_team_news(
         timeout=timeout,
         client=client,
     )
-    return normalize_news_results(raw, team=team, limit=limit), raw
+    result = (normalize_news_results(raw, team=team, limit=limit), raw)
+    news_cache.set(key, result)
+    return result
 
 
 def search_match_news(
@@ -266,6 +277,22 @@ def search_match_news(
     home = resolve_team_name(home)
     away = resolve_team_name(away)
     label = f"{home} vs {away}"
+    key = cache_key(
+        "match_news",
+        {
+            "home": home,
+            "away": away,
+            "when": when,
+            "gl": gl,
+            "hl": hl,
+            "limit": limit,
+            "focus": focus,
+        },
+    )
+    cached = news_cache.get(key)
+    if cached is not None:
+        return cached
+
     params: dict[str, Any] = {
         "engine": "google",
         "tbm": "nws",
@@ -285,7 +312,9 @@ def search_match_news(
         timeout=timeout,
         client=client,
     )
-    return normalize_news_results(raw, team=label, limit=limit), raw
+    result = (normalize_news_results(raw, team=label, limit=limit), raw)
+    news_cache.set(key, result)
+    return result
 
 
 def search_teams_news(
