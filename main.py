@@ -1,5 +1,6 @@
 import asyncio
 import os
+from typing import Any
 
 from dotenv import load_dotenv
 from mcp import Client
@@ -14,11 +15,27 @@ BASE_SYSTEM_PROMPT = (
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 
+def mcp_tools_to_openai(tools: list[Any]) -> list[dict[str, Any]]:
+    openai_tools: list[dict[str, Any]] = []
+    for tool in tools:
+        openai_tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description or tool.name,
+                    "parameters": tool.input_schema or {"type": "object", "properties": {}},
+                },
+            }
+        )
+    return openai_tools
+
+
 async def main() -> None:
 
     async with Client(os.environ["LIGA_MX_MCP_URL"]) as mcp_client:
-        tools = await mcp_client.list_tools()
-
+        list_tools = await mcp_client.list_tools()
+        openai_tools = mcp_tools_to_openai(list_tools.tools)
         if mcp_client.instructions:
             system_prompt = f"{BASE_SYSTEM_PROMPT}\n\n{mcp_client.instructions}"
         else:
@@ -53,6 +70,8 @@ async def main() -> None:
                 response = await llm_client.chat.completions.create(
                     model=MODEL,
                     messages=messages,
+                    tools=openai_tools,
+                    tool_choice="auto",
                 )
             except OpenAIError as exc:
                 print(f"Error: {exc}")
@@ -60,8 +79,11 @@ async def main() -> None:
                 continue
 
             assistant_message = response.choices[0].message.content or ""
+            tool_calls = response.choices[0].message.tool_calls
+
             messages.append({"role": "assistant", "content": assistant_message})
             print(f"\nAssistant: {assistant_message}\n")
+            print(f">>> Tool calls: {tool_calls}")
 
 
 if __name__ == "__main__":
