@@ -15,6 +15,8 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 
+from team_aliases import resolve_team_name
+
 load_dotenv()
 
 SERPAPI_SEARCH_URL = "https://serpapi.com/search"
@@ -76,7 +78,7 @@ _EXCLUDE_TEXT_RE = re.compile(r"femenil|femenino", re.IGNORECASE)
 
 def build_team_query(team: str) -> str:
     """Build a Google News query focused on a Liga MX (men's) club."""
-    team = team.strip()
+    team = resolve_team_name(team)
     exclusions = " ".join(f"-{term}" for term in _EXCLUDE_TERMS)
     return f'"{team}" (Liga MX OR futbol OR fútbol OR soccer) {exclusions}'
 
@@ -190,6 +192,7 @@ def search_team_news(
 
     Returns ``(articles, raw_response)``.
     """
+    team = resolve_team_name(team)
     params: dict[str, Any] = {
         "engine": "google",
         "tbm": "nws",

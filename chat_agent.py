@@ -28,6 +28,7 @@ from serpapi_news import (
     enrich_articles_with_bodies,
     search_teams_news,
 )
+from team_aliases import resolve_team_name, resolve_team_names
 
 mlflow.openai.autolog()
 load_dotenv()
@@ -101,6 +102,21 @@ def resolve_profile(name: str) -> tuple[str, str, ReasoningEffort]:
     return key, profile["model"], profile["reasoning_effort"]  # type: ignore[return-value]
 
 
+def resolve_team_args(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Normalize known Liga MX team aliases inside tool argument values."""
+
+    def _resolve_value(value: Any) -> Any:
+        if isinstance(value, str):
+            return resolve_team_name(value)
+        if isinstance(value, list):
+            return [_resolve_value(item) for item in value]
+        if isinstance(value, dict):
+            return {key: _resolve_value(item) for key, item in value.items()}
+        return value
+
+    return {key: _resolve_value(value) for key, value in arguments.items()}
+
+
 def mcp_tools_to_openai(tools: list[Tool]) -> list[FunctionToolParam]:
     """Convert MCP tool definitions into OpenAI Responses API function tool schemas."""
     openai_tools: list[FunctionToolParam] = []
@@ -139,6 +155,10 @@ def _run_search_team_news(arguments: dict[str, Any]) -> str:
     else:
         return "Error: 'teams' debe ser un arreglo no vacío con nombres de equipos."
 
+    if not teams:
+        return "Error: 'teams' debe ser un arreglo no vacío con nombres de equipos."
+
+    teams = resolve_team_names(teams)
     if not teams:
         return "Error: 'teams' debe ser un arreglo no vacío con nombres de equipos."
 
@@ -200,6 +220,8 @@ async def run_tool_call(
 
     if not isinstance(arguments, dict):
         return f"Error: tool arguments must be a JSON object, got {type(arguments).__name__}.", None
+
+    arguments = resolve_team_args(arguments)
 
     if name == SEARCH_TEAM_NEWS_TOOL_NAME:
         try:
