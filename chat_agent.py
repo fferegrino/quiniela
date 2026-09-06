@@ -26,6 +26,7 @@ from typing_extensions import Self
 from serpapi_news import (
     SerpApiError,
     enrich_articles_with_bodies,
+    search_matches_news,
     search_teams_news,
 )
 from team_aliases import resolve_team_name, resolve_team_names
@@ -53,18 +54,49 @@ SEARCH_TEAM_NEWS_TOOL: FunctionToolParam = {
     "type": "function",
     "name": SEARCH_TEAM_NEWS_TOOL_NAME,
     "description": (
-        "Busca noticias recientes de equipos de la Liga MX / fútbol mexicano en Google News (SerpApi). "
-        "Úsala para lesiones, forma reciente, rumores, alineaciones o cobertura de prensa que ayude a armar quinielas. "
-        "Pasa uno o más nombres de clubes (por ejemplo: América, Cruz Azul, Guadalajara)."
+        "Busca noticias recientes de la Liga MX / fútbol mexicano en Google News (SerpApi). "
+        "Prefiere `matches` (partido concreto: local vs visitante) para armar quinielas; "
+        "usa `teams` solo cuando necesites contexto de un club sin rival. "
+        "Opcionalmente filtra con `focus` (lesiones, alineacion, forma). "
+        "Ejemplo de partido: matches=[{home:'América', away:'Monterrey'}], focus='lesiones'."
     ),
     "parameters": {
         "type": "object",
         "properties": {
+            "matches": {
+                "type": "array",
+                "minItems": 1,
+                "description": (
+                    "Partidos a buscar. Preferido sobre `teams`. "
+                    "Cada ítem es {home, away}, por ejemplo: "
+                    "[{'home': 'América', 'away': 'Monterrey'}]."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "home": {"type": "string", "description": "Equipo local."},
+                        "away": {"type": "string", "description": "Equipo visitante."},
+                    },
+                    "required": ["home", "away"],
+                    "additionalProperties": False,
+                },
+            },
             "teams": {
                 "type": "array",
                 "items": {"type": "string"},
                 "minItems": 1,
-                "description": "Nombres de clubes a buscar, por ejemplo: ['América', 'Cruz Azul'].",
+                "description": (
+                    "Nombres de clubes sueltos (menos preciso que `matches`). Ejemplo: ['América', 'Cruz Azul']."
+                ),
+            },
+            "focus": {
+                "type": "string",
+                "enum": ["lesiones", "alineacion", "forma", "general"],
+                "description": (
+                    "Enfoque temático de la búsqueda. "
+                    "'lesiones' prioriza bajas/dudas; 'alineacion' titulares/once; "
+                    "'forma' rachas/resultados. Por defecto: general."
+                ),
             },
             "when": {
                 "type": "string",
@@ -75,7 +107,7 @@ SEARCH_TEAM_NEWS_TOOL: FunctionToolParam = {
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 10,
-                "description": "Máximo de artículos por equipo (1-10). Por defecto: 5.",
+                "description": "Máximo de artículos por equipo o partido (1-10). Por defecto: 5.",
             },
             "read_bodies": {
                 "type": "boolean",
@@ -85,7 +117,7 @@ SEARCH_TEAM_NEWS_TOOL: FunctionToolParam = {
                 ),
             },
         },
-        "required": ["teams"],
+        "required": [],
         "additionalProperties": False,
     },
     "strict": False,
@@ -147,20 +179,41 @@ def tool_result_text(result: CallToolResult) -> str:
 
 def _run_search_team_news(arguments: dict[str, Any]) -> str:
     """Execute the local SerpApi news tool and return JSON text for the model."""
+    matches_raw = arguments.get("matches")
     teams_raw = arguments.get("teams")
-    if isinstance(teams_raw, str):
-        teams = [teams_raw.strip()] if teams_raw.strip() else []
-    elif isinstance(teams_raw, list):
-        teams = [str(team).strip() for team in teams_raw if str(team).strip()]
-    else:
-        return "Error: 'teams' debe ser un arreglo no vacío con nombres de equipos."
 
-    if not teams:
-        return "Error: 'teams' debe ser un arreglo no vacío con nombres de equipos."
+    matches: list[tuple[str, str]] = []
+    if matches_raw is not None:
+        if not isinstance(matches_raw, list) or not matches_raw:
+            return "Error: 'matches' debe ser un arreglo no vacío de {home, away}."
+        for item in matches_raw:
+            if not isinstance(item, dict):
+                return "Error: cada ítem de 'matches' debe ser un objeto {home, away}."
+            home = resolve_team_name(str(item.get("home") or "").strip())
+            away = resolve_team_name(str(item.get("away") or "").strip())
+            if not home or not away:
+                return "Error: cada partido en 'matches' necesita 'home' y 'away' no vacíos."
+            matches.append((home, away))
 
-    teams = resolve_team_names(teams)
-    if not teams:
-        return "Error: 'teams' debe ser un arreglo no vacío con nombres de equipos."
+    teams: list[str] = []
+    if teams_raw is not None:
+        if isinstance(teams_raw, str):
+            teams = [teams_raw.strip()] if teams_raw.strip() else []
+        elif isinstance(teams_raw, list):
+            teams = [str(team).strip() for team in teams_raw if str(team).strip()]
+        else:
+            return "Error: 'teams' debe ser un arreglo con nombres de equipos."
+        teams = resolve_team_names(teams)
+
+    if not matches and not teams:
+        return "Error: indica 'matches' (preferido) o 'teams' con al menos un valor."
+
+    focus_raw = arguments.get("focus") or "general"
+    if not isinstance(focus_raw, str):
+        return "Error: 'focus' debe ser 'lesiones', 'alineacion', 'forma' o 'general'."
+    focus = focus_raw.strip().lower()
+    if focus not in {"lesiones", "alineacion", "forma", "general"}:
+        return "Error: 'focus' debe ser 'lesiones', 'alineacion', 'forma' o 'general'."
 
     when = arguments.get("when") or "7d"
     if not isinstance(when, str):
@@ -175,12 +228,17 @@ def _run_search_team_news(arguments: dict[str, Any]) -> str:
 
     read_bodies = bool(arguments.get("read_bodies", False))
 
-    articles = search_teams_news(teams, when=when, limit_per_team=limit)
+    articles = []
+    if matches:
+        articles.extend(search_matches_news(matches, when=when, limit_per_match=limit, focus=focus))
+    if teams:
+        articles.extend(search_teams_news(teams, when=when, limit_per_team=limit, focus=focus))
+
     if read_bodies and articles:
         articles = enrich_articles_with_bodies(articles, limit=min(3, len(articles)))
 
-    payload = {
-        "teams": teams,
+    payload: dict[str, Any] = {
+        "focus": focus,
         "when": when,
         "count": len(articles),
         "articles": [
@@ -196,8 +254,12 @@ def _run_search_team_news(arguments: dict[str, Any]) -> str:
             for article in articles
         ],
     }
+    if matches:
+        payload["matches"] = [{"home": home, "away": away} for home, away in matches]
+    if teams:
+        payload["teams"] = teams
     if not articles:
-        payload["message"] = "No se encontraron noticias para los equipos solicitados."
+        payload["message"] = "No se encontraron noticias para la consulta solicitada."
     return json.dumps(payload, ensure_ascii=False)
 
 

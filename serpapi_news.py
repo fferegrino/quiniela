@@ -75,12 +75,45 @@ def get_serpapi_key() -> str:
 _EXCLUDE_TERMS = ("femenil", "femenino")
 _EXCLUDE_TEXT_RE = re.compile(r"femenil|femenino", re.IGNORECASE)
 
+# Optional topical boosters for quiniela-relevant coverage.
+FOCUS_QUERY_TERMS: dict[str, str] = {
+    "lesiones": "(lesión OR lesion OR lesiones OR baja OR bajas OR duda OR descartado OR lesión muscular)",
+    "alineacion": "(alineación OR alineacion OR once inicial OR titular OR titulares)",
+    "forma": "(forma OR racha OR resultados OR victoria OR derrota OR empate)",
+    "general": "",
+}
 
-def build_team_query(team: str) -> str:
+
+def _liga_mx_exclusions() -> str:
+    return " ".join(f"-{term}" for term in _EXCLUDE_TERMS)
+
+
+def build_team_query(team: str, *, focus: str | None = None) -> str:
     """Build a Google News query focused on a Liga MX (men's) club."""
     team = resolve_team_name(team)
-    exclusions = " ".join(f"-{term}" for term in _EXCLUDE_TERMS)
-    return f'"{team}" (Liga MX OR futbol OR fútbol OR soccer) {exclusions}'
+    focus_key = (focus or "general").strip().lower()
+    focus_terms = FOCUS_QUERY_TERMS.get(focus_key, "")
+    parts = [f'"{team}"', "(Liga MX OR futbol OR fútbol OR soccer)"]
+    if focus_terms:
+        parts.append(focus_terms)
+    parts.append(_liga_mx_exclusions())
+    return " ".join(parts)
+
+
+def build_match_query(home: str, away: str, *, focus: str | None = None) -> str:
+    """Build a fixture-focused Google News query for two Liga MX clubs."""
+    home = resolve_team_name(home)
+    away = resolve_team_name(away)
+    focus_key = (focus or "general").strip().lower()
+    focus_terms = FOCUS_QUERY_TERMS.get(focus_key, "")
+    match_clause = (
+        f'(("{home}" AND "{away}") OR ("{home}" vs "{away}") OR ("{away}" vs "{home}") OR ("{home}" vs. "{away}"))'
+    )
+    parts = [match_clause, "(Liga MX OR futbol OR fútbol OR soccer)"]
+    if focus_terms:
+        parts.append(focus_terms)
+    parts.append(_liga_mx_exclusions())
+    return " ".join(parts)
 
 
 def _is_femenil_article(title: str, snippet: str | None) -> bool:
@@ -182,6 +215,7 @@ def search_team_news(
     gl: str = DEFAULT_GL,
     hl: str = DEFAULT_HL,
     limit: int | None = 20,
+    focus: str | None = None,
     timeout: float = DEFAULT_SEARCH_TIMEOUT,
     client: httpx.Client | None = None,
 ) -> tuple[list[NewsArticle], dict[str, Any]]:
@@ -196,7 +230,7 @@ def search_team_news(
     params: dict[str, Any] = {
         "engine": "google",
         "tbm": "nws",
-        "q": build_team_query(team),
+        "q": build_team_query(team, focus=focus),
         "gl": gl,
         "hl": hl,
     }
@@ -215,6 +249,45 @@ def search_team_news(
     return normalize_news_results(raw, team=team, limit=limit), raw
 
 
+def search_match_news(
+    home: str,
+    away: str,
+    *,
+    api_key: str | None = None,
+    when: str | None = "7d",
+    gl: str = DEFAULT_GL,
+    hl: str = DEFAULT_HL,
+    limit: int | None = 20,
+    focus: str | None = None,
+    timeout: float = DEFAULT_SEARCH_TIMEOUT,
+    client: httpx.Client | None = None,
+) -> tuple[list[NewsArticle], dict[str, Any]]:
+    """Search Google News for coverage of a specific Liga MX fixture."""
+    home = resolve_team_name(home)
+    away = resolve_team_name(away)
+    label = f"{home} vs {away}"
+    params: dict[str, Any] = {
+        "engine": "google",
+        "tbm": "nws",
+        "q": build_match_query(home, away, focus=focus),
+        "gl": gl,
+        "hl": hl,
+    }
+    if limit is not None:
+        params["num"] = max(1, min(int(limit), 100))
+    tbs = when_to_tbs(when)
+    if tbs:
+        params["tbs"] = tbs
+
+    raw = serpapi_search(
+        params,
+        api_key=api_key,
+        timeout=timeout,
+        client=client,
+    )
+    return normalize_news_results(raw, team=label, limit=limit), raw
+
+
 def search_teams_news(
     teams: list[str],
     *,
@@ -223,6 +296,7 @@ def search_teams_news(
     gl: str = DEFAULT_GL,
     hl: str = DEFAULT_HL,
     limit_per_team: int | None = 20,
+    focus: str | None = None,
     timeout: float = DEFAULT_SEARCH_TIMEOUT,
 ) -> list[NewsArticle]:
     """Search news for multiple teams (one SerpApi request per team)."""
@@ -237,10 +311,43 @@ def search_teams_news(
                 gl=gl,
                 hl=hl,
                 limit=limit_per_team,
+                focus=focus,
                 timeout=timeout,
                 client=client,
             )
             articles.extend(team_articles)
+    return articles
+
+
+def search_matches_news(
+    matches: list[tuple[str, str]],
+    *,
+    api_key: str | None = None,
+    when: str | None = "7d",
+    gl: str = DEFAULT_GL,
+    hl: str = DEFAULT_HL,
+    limit_per_match: int | None = 20,
+    focus: str | None = None,
+    timeout: float = DEFAULT_SEARCH_TIMEOUT,
+) -> list[NewsArticle]:
+    """Search news for multiple fixtures (one SerpApi request per match)."""
+    key = api_key or get_serpapi_key()
+    articles: list[NewsArticle] = []
+    with httpx.Client(timeout=timeout) as client:
+        for home, away in matches:
+            match_articles, _ = search_match_news(
+                home,
+                away,
+                api_key=key,
+                when=when,
+                gl=gl,
+                hl=hl,
+                limit=limit_per_match,
+                focus=focus,
+                timeout=timeout,
+                client=client,
+            )
+            articles.extend(match_articles)
     return articles
 
 
