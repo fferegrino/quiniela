@@ -29,8 +29,8 @@ from serpapi_news import (
     search_matches_news,
     search_teams_news,
 )
-from team_aliases import resolve_team_name, resolve_team_names, resolve_team_slug
-from tool_cache import cache_key, mcp_cache
+from team_aliases import known_slugs, resolve_team_name, resolve_team_names, resolve_team_slug
+from tool_cache import cache_key, mcp_cache, news_cache
 
 mlflow.openai.autolog()
 load_dotenv()
@@ -41,6 +41,7 @@ PROFILES: dict[str, dict[str, str]] = {
     "mini": {"model": "gpt-5-mini", "reasoning_effort": "minimal"},
     "reasoning": {"model": "gpt-5.6", "reasoning_effort": "high"},
 }
+AGENT_CODE_VERSION = 3  # bump when tool/arg resolution changes; Streamlit recreates the agent
 DEFAULT_PROFILE = os.getenv("QUINIELA_PROFILE", "reasoning")
 MAX_TOOL_ROUNDS = 10
 
@@ -203,16 +204,50 @@ def resolve_mcp_team_args(arguments: dict[str, Any]) -> dict[str, Any]:
     return {key: _resolve_value(key, value) for key, value in arguments.items()}
 
 
-def mcp_tools_to_openai(tools: list[Tool]) -> list[FunctionToolParam]:
-    """Convert MCP tool definitions into OpenAI Responses API function tool schemas."""
+def mcp_tools_to_openai(
+    tools: list[Tool],
+    *,
+    valid_slugs: list[str] | None = None,
+) -> list[FunctionToolParam]:
+    """Convert MCP tool definitions into OpenAI Responses API function tool schemas.
+
+    When ``valid_slugs`` is provided, slug-like string properties are constrained
+    with an enum so the model prefers API identifiers (america, cruz-azul, …).
+    """
     openai_tools: list[FunctionToolParam] = []
     for tool in tools:
+        parameters: dict[str, Any]
+        raw_parameters = tool.input_schema or {"type": "object", "properties": {}}
+        if isinstance(raw_parameters, dict):
+            parameters = json.loads(json.dumps(raw_parameters))
+        else:
+            parameters = {"type": "object", "properties": {}}
+
+        has_slug_props = False
+        if valid_slugs:
+            properties = parameters.get("properties")
+            if isinstance(properties, dict):
+                for key, schema in properties.items():
+                    if not isinstance(schema, dict):
+                        continue
+                    if key in _MCP_TEAM_KEYS or str(key).endswith("_slug"):
+                        has_slug_props = True
+                        if schema.get("type", "string") == "string":
+                            schema["enum"] = list(valid_slugs)
+                            schema["description"] = (
+                                schema.get("description") or key
+                            ) + " Use a Liga MX API slug (e.g. america, cruz-azul, guadalajara), not the display name."
+
+        description_suffix = ""
+        if valid_slugs and has_slug_props:
+            description_suffix = f" Team identifiers must be slugs from: {', '.join(valid_slugs)}."
+
         openai_tools.append(
             {
                 "type": "function",
                 "name": tool.name,
-                "description": tool.description or tool.name,
-                "parameters": tool.input_schema or {"type": "object", "properties": {}},
+                "description": (tool.description or tool.name) + description_suffix,
+                "parameters": parameters,
                 "strict": False,
             }
         )
@@ -463,6 +498,11 @@ async def chat_turn(
                     start_args = None
             except json.JSONDecodeError:
                 start_args = None
+            if start_args is not None:
+                if tool_call.name == SEARCH_TEAM_NEWS_TOOL_NAME:
+                    start_args = resolve_team_args(start_args)
+                else:
+                    start_args = resolve_mcp_team_args(start_args)
             _emit(on_tool_event, ToolEvent(name=tool_call.name, phase="start", arguments=start_args))
 
         results = await asyncio.gather(*(run_tool_call(mcp_client, tool_call) for tool_call in function_calls))
@@ -557,12 +597,35 @@ class QuinielaAgent:
         self._mcp_client = Client(mcp_url)
         await self._mcp_client.__aenter__()
 
+        # Drop stale tool payloads from prior processes/sessions.
+        mcp_cache.clear()
+        news_cache.clear()
+
+        slugs = known_slugs()
+        try:
+            listed = await self._mcp_client.call_tool("list_teams", {})
+            payload = listed.structured_content
+            if isinstance(payload, dict):
+                remote = payload.get("result") or payload.get("teams") or payload.get("slugs")
+                if isinstance(remote, list):
+                    remote_slugs = [str(item).strip() for item in remote if str(item).strip()]
+                    if remote_slugs:
+                        slugs = sorted(set(slugs) | set(remote_slugs))
+        except (MCPError, httpx2.HTTPError, OSError, TimeoutError, TypeError, ValueError):
+            pass
+
         list_tools = await self._mcp_client.list_tools()
-        self._openai_tools = mcp_tools_to_openai(list_tools.tools) + [SEARCH_TEAM_NEWS_TOOL]
+        self._openai_tools = mcp_tools_to_openai(list_tools.tools, valid_slugs=slugs) + [SEARCH_TEAM_NEWS_TOOL]
+
+        slug_policy = (
+            "Para herramientas MCP (`team_form`, `team_position`, `head_to_head`) usa siempre "
+            f"slugs de API en minúsculas (ej. america, cruz-azul, guadalajara), nunca el nombre "
+            f"con mayúsculas/acentos. Slugs válidos: {', '.join(slugs)}."
+        )
         if self._mcp_client.instructions:
-            self._system_prompt = f"{BASE_SYSTEM_PROMPT}\n\n{self._mcp_client.instructions}"
+            self._system_prompt = f"{BASE_SYSTEM_PROMPT}\n\n{slug_policy}\n\n{self._mcp_client.instructions}"
         else:
-            self._system_prompt = BASE_SYSTEM_PROMPT
+            self._system_prompt = f"{BASE_SYSTEM_PROMPT}\n\n{slug_policy}"
         self._started = True
 
     async def close(self) -> None:

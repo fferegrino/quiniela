@@ -12,6 +12,7 @@ from typing import Any
 import streamlit as st
 
 from chat_agent import (
+    AGENT_CODE_VERSION,
     DEFAULT_PROFILE,
     PROFILES,
     SEARCH_TEAM_NEWS_TOOL_NAME,
@@ -31,10 +32,19 @@ def _runner() -> AsyncRunner:
 
 def _agent() -> QuinielaAgent:
     runner = _runner()
-    if "agent" not in st.session_state:
+    stale = st.session_state.get("agent_code_version") != AGENT_CODE_VERSION
+    if "agent" not in st.session_state or stale:
+        old = st.session_state.pop("agent", None)
+        if old is not None:
+            try:
+                runner.run(old.close())
+            except (RuntimeError, OSError, TimeoutError):
+                pass
         agent = QuinielaAgent(profile=DEFAULT_PROFILE)
         runner.run(agent.start())
         st.session_state.agent = agent
+        st.session_state.agent_code_version = AGENT_CODE_VERSION
+        st.session_state.messages = []
     return st.session_state.agent
 
 

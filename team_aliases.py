@@ -49,9 +49,20 @@ CANONICAL_TO_SLUG: dict[str, str] = {
     "Tigres UANL": "tigres",
 }
 
+# Extra historical / alternate slugs returned by list_teams.
+EXTRA_SLUGS: tuple[str, ...] = (
+    "atlante",
+    "chiapas",
+    "dorados",
+    "leones-negros",
+    "lobos-buap",
+    "morelia",
+    "veracruz",
+)
+
 # Lowercased alias → canonical name. Includes the canonical forms themselves.
 _ALIAS_TO_CANONICAL: dict[str, str] = {}
-_KNOWN_SLUGS: set[str] = set(CANONICAL_TO_SLUG.values())
+_KNOWN_SLUGS: set[str] = set(CANONICAL_TO_SLUG.values()) | set(EXTRA_SLUGS)
 
 
 def _register(canonical: str, *aliases: str) -> None:
@@ -126,7 +137,8 @@ for _canonical, _slug in CANONICAL_TO_SLUG.items():
 
 
 def _clean_team_token(name: str) -> str:
-    return " ".join(name.strip().split())
+    # NFC so "é" composed forms match alias keys consistently.
+    return unicodedata.normalize("NFC", " ".join(name.strip().split()))
 
 
 def resolve_team_name(name: str) -> str:
@@ -167,11 +179,15 @@ def resolve_team_slug(name: str) -> str:
     if not cleaned:
         return cleaned
 
+    # Accent-insensitive match first ("América" / "Necaxa" → america / necaxa).
+    ascii_folded = _ascii_slug(cleaned)
+    if ascii_folded in _KNOWN_SLUGS:
+        return ascii_folded
+
     folded = cleaned.casefold()
     if folded in _KNOWN_SLUGS:
         return folded
 
-    # Hyphen forms already look like slugs; keep if known after light normalization.
     hyphenated = folded.replace(" ", "-")
     if hyphenated in _KNOWN_SLUGS:
         return hyphenated
@@ -180,7 +196,8 @@ def resolve_team_slug(name: str) -> str:
     if canonical in CANONICAL_TO_SLUG:
         return CANONICAL_TO_SLUG[canonical]
 
-    return _ascii_slug(cleaned)
+    # Last resort: ascii slug even if not in the known set.
+    return ascii_folded or _ascii_slug(cleaned)
 
 
 def resolve_team_slugs(names: list[str]) -> list[str]:
@@ -194,6 +211,11 @@ def resolve_team_slugs(names: list[str]) -> list[str]:
         seen.add(slug)
         resolved.append(slug)
     return resolved
+
+
+def known_slugs() -> list[str]:
+    """Return sorted Liga MX MCP slugs the agent may pass to tools."""
+    return sorted(_KNOWN_SLUGS)
 
 
 def canonical_teams() -> list[str]:
