@@ -6,8 +6,20 @@ from chat_agent import (
     DEFAULT_PROFILE,
     SEARCH_TEAM_NEWS_TOOL_NAME,
     QuinielaAgent,
+    ToolEvent,
+    format_tool_args,
     resolve_profile,
 )
+
+
+def _on_tool_event(event: ToolEvent) -> None:
+    args = format_tool_args(event.arguments)
+    suffix = f" {args}" if args else ""
+    if event.phase == "start":
+        print(f"  → tool `{event.name}`…{suffix}")
+        return
+    status = "ok" if event.ok else "error"
+    print(f"  ← tool `{event.name}` ({status})")
 
 
 async def main() -> None:
@@ -38,13 +50,16 @@ async def main() -> None:
                 print(f"Switched to {agent.profile_name} → {agent.model} (reasoning_effort={agent.reasoning_effort})")
                 continue
 
-            result = await agent.ask(user_input)
+            result = await agent.ask(user_input, on_tool_event=_on_tool_event)
             if result.error:
                 print(f"Error: {result.error}")
                 continue
             if result.text is None:
                 continue
 
+            if result.tools:
+                names = ", ".join(f"`{tool.name}`" for tool in result.tools)
+                print(f"\n[tools used: {names}]")
             print(f"\nAssistant: {result.text}\n")
 
 

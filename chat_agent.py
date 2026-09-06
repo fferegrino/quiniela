@@ -6,7 +6,8 @@ import asyncio
 import json
 import os
 import threading
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from types import TracebackType
 from typing import Any, Literal, TypeVar
@@ -183,38 +184,76 @@ def _run_search_team_news(arguments: dict[str, Any]) -> str:
 async def run_tool_call(
     mcp_client: Client,
     tool_call: ResponseFunctionToolCall,
-) -> str:
+) -> tuple[str, dict[str, Any] | None]:
     """Execute one Responses API function call (local SerpApi news or MCP).
 
-    Returns a string suitable for a ``function_call_output`` item. Invalid
-    arguments and transport/tool failures are returned as error text so the
-    model can recover instead of aborting the turn.
+    Returns ``(result_text, parsed_arguments_or_none)``. Invalid arguments and
+    transport/tool failures are returned as error text so the model can recover
+    instead of aborting the turn.
     """
     name = tool_call.name
     raw_arguments = tool_call.arguments or "{}"
     try:
         arguments: Any = json.loads(raw_arguments)
     except json.JSONDecodeError as exc:
-        return f"Error: invalid JSON arguments for {name}: {exc}. Arguments were: {raw_arguments}"
+        return f"Error: invalid JSON arguments for {name}: {exc}. Arguments were: {raw_arguments}", None
 
     if not isinstance(arguments, dict):
-        return f"Error: tool arguments must be a JSON object, got {type(arguments).__name__}."
+        return f"Error: tool arguments must be a JSON object, got {type(arguments).__name__}.", None
 
     if name == SEARCH_TEAM_NEWS_TOOL_NAME:
         try:
-            return await asyncio.to_thread(_run_search_team_news, arguments)
+            return await asyncio.to_thread(_run_search_team_news, arguments), arguments
         except (SerpApiError, KeyError, OSError, httpx.HTTPError, TimeoutError) as exc:
-            return f"Error calling tool {name}: {exc}"
+            return f"Error calling tool {name}: {exc}", arguments
 
     try:
         result = await mcp_client.call_tool(name, arguments)
     except (MCPError, httpx2.HTTPError, OSError, TimeoutError) as exc:
-        return f"Error calling tool {name}: {exc}"
+        return f"Error calling tool {name}: {exc}", arguments
 
     text = tool_result_text(result)
     if result.is_error:
-        return f"Error from tool {name}: {text}"
-    return text
+        return f"Error from tool {name}: {text}", arguments
+    return text, arguments
+
+
+@dataclass(frozen=True)
+class ToolEvent:
+    """Live progress event emitted while a tool runs."""
+
+    name: str
+    phase: Literal["start", "end"]
+    arguments: dict[str, Any] | None = None
+    ok: bool = True
+
+
+@dataclass(frozen=True)
+class ToolUsage:
+    """Record of one tool invocation completed during a turn."""
+
+    name: str
+    arguments: dict[str, Any] | None = None
+    ok: bool = True
+
+
+def _emit(on_tool_event: Callable[[ToolEvent], None] | None, event: ToolEvent) -> None:
+    if on_tool_event is None:
+        return
+    on_tool_event(event)
+
+
+def format_tool_args(arguments: dict[str, Any] | None) -> str:
+    """Compact JSON for displaying tool arguments in a frontend."""
+    if not arguments:
+        return ""
+    try:
+        rendered = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        rendered = str(arguments)
+    if len(rendered) > 160:
+        return rendered[:157] + "…"
+    return rendered
 
 
 async def chat_turn(
@@ -226,16 +265,17 @@ async def chat_turn(
     previous_response_id: str | None,
     model: str,
     reasoning_effort: ReasoningEffort,
-) -> tuple[str | None, str | None, str | None]:
+    on_tool_event: Callable[[ToolEvent], None] | None = None,
+) -> tuple[str | None, str | None, str | None, list[ToolUsage]]:
     """Run one user turn via the Responses API, including tool-calling rounds.
 
     Uses ``previous_response_id`` so reasoning items stay available across
-    function calls. Returns ``(assistant_text, latest_response_id, error)``.
-    On API failure or too many tool rounds, ``assistant_text`` is ``None`` and
-    ``error`` explains why; ``latest_response_id`` stays at the prior value.
+    function calls. Returns
+    ``(assistant_text, latest_response_id, error, tools_used)``.
     """
     input_items: ResponseInputParam = [{"role": "user", "content": user_input}]
     response_id = previous_response_id
+    tools_used: list[ToolUsage] = []
 
     for _ in range(MAX_TOOL_ROUNDS):
         try:
@@ -249,17 +289,31 @@ async def chat_turn(
                 previous_response_id=response_id,
             )
         except OpenAIError as exc:
-            return None, previous_response_id, str(exc)
+            return None, previous_response_id, str(exc), tools_used
 
         response_id = response.id
         function_calls = [item for item in response.output if isinstance(item, ResponseFunctionToolCall)]
 
         if not function_calls:
-            return response.output_text or "", response_id, None
+            return response.output_text or "", response_id, None, tools_used
 
         input_items = []
         for tool_call in function_calls:
-            text_result = await run_tool_call(mcp_client, tool_call)
+            try:
+                start_args: dict[str, Any] | None = json.loads(tool_call.arguments or "{}")
+                if not isinstance(start_args, dict):
+                    start_args = None
+            except json.JSONDecodeError:
+                start_args = None
+            _emit(on_tool_event, ToolEvent(name=tool_call.name, phase="start", arguments=start_args))
+            text_result, arguments = await run_tool_call(mcp_client, tool_call)
+            ok = not text_result.startswith("Error")
+            usage = ToolUsage(name=tool_call.name, arguments=arguments, ok=ok)
+            tools_used.append(usage)
+            _emit(
+                on_tool_event,
+                ToolEvent(name=tool_call.name, phase="end", arguments=arguments, ok=ok),
+            )
             input_items.append(
                 {
                     "type": "function_call_output",
@@ -268,7 +322,12 @@ async def chat_turn(
                 }
             )
 
-    return None, previous_response_id, f"Exceeded {MAX_TOOL_ROUNDS} tool rounds without a final answer."
+    return (
+        None,
+        previous_response_id,
+        f"Exceeded {MAX_TOOL_ROUNDS} tool rounds without a final answer.",
+        tools_used,
+    )
 
 
 @dataclass
@@ -277,6 +336,7 @@ class TurnResult:
 
     text: str | None
     error: str | None = None
+    tools: list[ToolUsage] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -373,7 +433,12 @@ class QuinielaAgent:
         """Drop OpenAI conversation chaining without changing the profile."""
         self.previous_response_id = None
 
-    async def ask(self, user_input: str) -> TurnResult:
+    async def ask(
+        self,
+        user_input: str,
+        *,
+        on_tool_event: Callable[[ToolEvent], None] | None = None,
+    ) -> TurnResult:
         """Send one user message and return the assistant reply (or an error)."""
         if not self._started or self._llm_client is None or self._mcp_client is None:
             raise RuntimeError("QuinielaAgent is not started. Call start() or use async with.")
@@ -382,7 +447,7 @@ class QuinielaAgent:
         if not text:
             return TurnResult(text=None, error="Empty message.")
 
-        reply, self.previous_response_id, error = await chat_turn(
+        reply, self.previous_response_id, error, tools = await chat_turn(
             self._llm_client,
             self._mcp_client,
             self._system_prompt,
@@ -391,13 +456,19 @@ class QuinielaAgent:
             self.previous_response_id,
             self._model,
             self._reasoning_effort,
+            on_tool_event=on_tool_event,
         )
-        return TurnResult(text=reply, error=error)
+        return TurnResult(text=reply, error=error, tools=tools)
 
 
-def ask_sync(agent: QuinielaAgent, user_input: str) -> TurnResult:
+def ask_sync(
+    agent: QuinielaAgent,
+    user_input: str,
+    *,
+    on_tool_event: Callable[[ToolEvent], None] | None = None,
+) -> TurnResult:
     """Run ``agent.ask`` from a synchronous host that owns no event loop."""
-    return asyncio.run(agent.ask(user_input))
+    return asyncio.run(agent.ask(user_input, on_tool_event=on_tool_event))
 
 
 T = TypeVar("T")
@@ -417,6 +488,9 @@ class AsyncRunner:
     def run(self, coro: Coroutine[Any, Any, T]) -> T:
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return future.result()
+
+    def submit(self, coro: Coroutine[Any, Any, T]) -> Future[T]:
+        return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
     def stop(self) -> None:
         self._loop.call_soon_threadsafe(self._loop.stop)
