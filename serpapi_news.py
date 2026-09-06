@@ -63,6 +63,14 @@ class SerpApiError(RuntimeError):
     """Raised when SerpApi returns an error response."""
 
 
+_NO_RESULTS_RE = re.compile(r"hasn'?t returned any results", re.IGNORECASE)
+
+
+def is_no_results_error(message: str) -> bool:
+    """True when SerpApi/Google simply found nothing for the query."""
+    return bool(_NO_RESULTS_RE.search(message))
+
+
 def get_serpapi_key() -> str:
     """Resolve the SerpApi key from common environment variable names."""
     for name in ("SERP_API_KEY", "SERPAPI_API_KEY", "SERPAPI_KEY"):
@@ -201,7 +209,20 @@ def serpapi_search(
     if not isinstance(payload, dict):
         raise SerpApiError(f"Unexpected SerpApi response type: {type(payload).__name__}")
     if payload.get("error"):
-        raise SerpApiError(str(payload["error"]))
+        message = str(payload["error"])
+        # Empty Google News hits are common for tight fixture+focus queries;
+        # treat them as zero results instead of failing the whole tool call.
+        if is_no_results_error(message):
+            return {
+                **payload,
+                "news_results": [],
+                "search_metadata": {
+                    **(payload.get("search_metadata") or {}),
+                    "status": "Success",
+                    "empty_reason": message,
+                },
+            }
+        raise SerpApiError(message)
     status = (payload.get("search_metadata") or {}).get("status")
     if status and status != "Success":
         raise SerpApiError(f"SerpApi search status: {status}")
@@ -228,34 +249,43 @@ def search_team_news(
     Returns ``(articles, raw_response)``.
     """
     team = resolve_team_name(team)
+    focus_key = (focus or "general").strip().lower() or "general"
     key = cache_key(
         "team_news",
-        {"team": team, "when": when, "gl": gl, "hl": hl, "limit": limit, "focus": focus},
+        {"team": team, "when": when, "gl": gl, "hl": hl, "limit": limit, "focus": focus_key},
     )
     cached = news_cache.get(key)
     if cached is not None:
         return cached
 
-    params: dict[str, Any] = {
-        "engine": "google",
-        "tbm": "nws",
-        "q": build_team_query(team, focus=focus),
-        "gl": gl,
-        "hl": hl,
-    }
-    if limit is not None:
-        params["num"] = max(1, min(int(limit), 100))
-    tbs = when_to_tbs(when)
-    if tbs:
-        params["tbs"] = tbs
+    def _run(active_focus: str | None) -> tuple[list[NewsArticle], dict[str, Any]]:
+        params: dict[str, Any] = {
+            "engine": "google",
+            "tbm": "nws",
+            "q": build_team_query(team, focus=active_focus),
+            "gl": gl,
+            "hl": hl,
+        }
+        if limit is not None:
+            params["num"] = max(1, min(int(limit), 100))
+        tbs = when_to_tbs(when)
+        if tbs:
+            params["tbs"] = tbs
+        raw_payload = serpapi_search(
+            params,
+            api_key=api_key,
+            timeout=timeout,
+            client=client,
+        )
+        return normalize_news_results(raw_payload, team=team, limit=limit), raw_payload
 
-    raw = serpapi_search(
-        params,
-        api_key=api_key,
-        timeout=timeout,
-        client=client,
-    )
-    result = (normalize_news_results(raw, team=team, limit=limit), raw)
+    articles, raw = _run(focus_key)
+    # Broaden once if a topical filter returned nothing.
+    if not articles and focus_key != "general":
+        articles, raw = _run("general")
+        raw = {**raw, "focus_fallback": "general"}
+
+    result = (articles, raw)
     news_cache.set(key, result)
     return result
 
@@ -277,6 +307,7 @@ def search_match_news(
     home = resolve_team_name(home)
     away = resolve_team_name(away)
     label = f"{home} vs {away}"
+    focus_key = (focus or "general").strip().lower() or "general"
     key = cache_key(
         "match_news",
         {
@@ -286,33 +317,41 @@ def search_match_news(
             "gl": gl,
             "hl": hl,
             "limit": limit,
-            "focus": focus,
+            "focus": focus_key,
         },
     )
     cached = news_cache.get(key)
     if cached is not None:
         return cached
 
-    params: dict[str, Any] = {
-        "engine": "google",
-        "tbm": "nws",
-        "q": build_match_query(home, away, focus=focus),
-        "gl": gl,
-        "hl": hl,
-    }
-    if limit is not None:
-        params["num"] = max(1, min(int(limit), 100))
-    tbs = when_to_tbs(when)
-    if tbs:
-        params["tbs"] = tbs
+    def _run(active_focus: str | None) -> tuple[list[NewsArticle], dict[str, Any]]:
+        params: dict[str, Any] = {
+            "engine": "google",
+            "tbm": "nws",
+            "q": build_match_query(home, away, focus=active_focus),
+            "gl": gl,
+            "hl": hl,
+        }
+        if limit is not None:
+            params["num"] = max(1, min(int(limit), 100))
+        tbs = when_to_tbs(when)
+        if tbs:
+            params["tbs"] = tbs
+        raw_payload = serpapi_search(
+            params,
+            api_key=api_key,
+            timeout=timeout,
+            client=client,
+        )
+        return normalize_news_results(raw_payload, team=label, limit=limit), raw_payload
 
-    raw = serpapi_search(
-        params,
-        api_key=api_key,
-        timeout=timeout,
-        client=client,
-    )
-    result = (normalize_news_results(raw, team=label, limit=limit), raw)
+    articles, raw = _run(focus_key)
+    # Fixture+focus queries are often too tight; fall back to the fixture only.
+    if not articles and focus_key != "general":
+        articles, raw = _run("general")
+        raw = {**raw, "focus_fallback": "general"}
+
+    result = (articles, raw)
     news_cache.set(key, result)
     return result
 
