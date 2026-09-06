@@ -3,6 +3,7 @@ import json
 import os
 from typing import Any
 
+import httpx
 import httpx2
 import mlflow
 from dotenv import load_dotenv
@@ -15,16 +16,68 @@ from openai.types.chat import (
     ChatCompletionToolParam,
 )
 
+from serpapi_news import (
+    SerpApiError,
+    enrich_articles_with_bodies,
+    search_teams_news,
+)
+
 mlflow.openai.autolog()
 
 load_dotenv()
 
 MODEL = "gpt-4o-mini"
 MAX_TOOL_ROUNDS = 8
-BASE_SYSTEM_PROMPT = (
-    """Eres un asistente experto en fútbol mexicano especializado en ayudar a llenar quinielas de la Liga MX."""
-)
+BASE_SYSTEM_PROMPT = """Eres un asistente experto en fútbol mexicano especializado en ayudar a llenar quinielas de la Liga MX, conociendo la información de los equipos, sus jugadores, sus partidos, sus resultados, sus estadísticas, sus noticias, sus rumores, sus alineaciones, sus lesiones, etc.
+
+Usa información de noticias recientes de los equipos para llenar quinielas, como lesiones, rumores, alineaciones, etc.
+
+Puedes consultar noticias recientes de equipos con la herramienta search_team_news cuando necesites contexto de prensa, lesiones, rumores o forma reciente."""
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+
+SEARCH_TEAM_NEWS_TOOL_NAME = "search_team_news"
+SEARCH_TEAM_NEWS_TOOL: ChatCompletionToolParam = {
+    "type": "function",
+    "function": {
+        "name": SEARCH_TEAM_NEWS_TOOL_NAME,
+        "description": (
+            "Busca noticias recientes de equipos de la Liga MX / fútbol mexicano en Google News (SerpApi). "
+            "Úsala para lesiones, forma reciente, rumores, alineaciones o cobertura de prensa que ayude a armar quinielas. "
+            "Pasa uno o más nombres de clubes (por ejemplo: América, Cruz Azul, Guadalajara)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "teams": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "description": "Nombres de clubes a buscar, por ejemplo: ['América', 'Cruz Azul'].",
+                },
+                "when": {
+                    "type": "string",
+                    "enum": ["1d", "7d", "30d", "1y"],
+                    "description": "Ventana de antigüedad de las noticias. Por defecto: 7d.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "description": "Máximo de artículos por equipo (1-10). Por defecto: 5.",
+                },
+                "read_bodies": {
+                    "type": "boolean",
+                    "description": (
+                        "Si es true, también descarga y extrae el texto de los primeros enlaces. "
+                        "Es más lento; úsalo solo cuando los snippets no basten."
+                    ),
+                },
+            },
+            "required": ["teams"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 
 def mcp_tools_to_openai(tools: list[Tool]) -> list[ChatCompletionToolParam]:
@@ -56,11 +109,63 @@ def tool_result_text(result: CallToolResult) -> str:
     return json.dumps({"is_error": bool(result.is_error)}, ensure_ascii=False)
 
 
+def _run_search_team_news(arguments: dict[str, Any]) -> str:
+    """Execute the local SerpApi news tool and return JSON text for the model."""
+    teams_raw = arguments.get("teams")
+    if isinstance(teams_raw, str):
+        teams = [teams_raw.strip()] if teams_raw.strip() else []
+    elif isinstance(teams_raw, list):
+        teams = [str(team).strip() for team in teams_raw if str(team).strip()]
+    else:
+        return "Error: 'teams' debe ser un arreglo no vacío con nombres de equipos."
+
+    if not teams:
+        return "Error: 'teams' debe ser un arreglo no vacío con nombres de equipos."
+
+    when = arguments.get("when") or "7d"
+    if not isinstance(when, str):
+        return "Error: 'when' debe ser una cadena como '1d', '7d', '30d' o '1y'."
+
+    limit_raw = arguments.get("limit", 5)
+    try:
+        limit = int(limit_raw)
+    except (TypeError, ValueError):
+        return "Error: 'limit' debe ser un entero entre 1 y 10."
+    limit = max(1, min(limit, 10))
+
+    read_bodies = bool(arguments.get("read_bodies", False))
+
+    articles = search_teams_news(teams, when=when, limit_per_team=limit)
+    if read_bodies and articles:
+        articles = enrich_articles_with_bodies(articles, limit=min(3, len(articles)))
+
+    payload = {
+        "teams": teams,
+        "when": when,
+        "count": len(articles),
+        "articles": [
+            {
+                "title": article.title,
+                "source": article.source,
+                "date": article.date,
+                "link": article.link,
+                "snippet": article.snippet,
+                "team": article.team,
+                **({"body": article.body} if article.body else {}),
+            }
+            for article in articles
+        ],
+    }
+    if not articles:
+        payload["message"] = "No se encontraron noticias para los equipos solicitados."
+    return json.dumps(payload, ensure_ascii=False)
+
+
 async def run_tool_call(
     mcp_client: Client,
     tool_call: ChatCompletionMessageFunctionToolCall,
 ) -> str:
-    """Execute one OpenAI function tool call against the MCP server.
+    """Execute one OpenAI function tool call (local SerpApi news or MCP).
 
     Returns a string suitable for a Chat Completions ``role=tool`` message.
     Invalid arguments and transport/tool failures are returned as error text
@@ -75,6 +180,12 @@ async def run_tool_call(
 
     if not isinstance(arguments, dict):
         return f"Error: tool arguments must be a JSON object, got {type(arguments).__name__}."
+
+    if name == SEARCH_TEAM_NEWS_TOOL_NAME:
+        try:
+            return await asyncio.to_thread(_run_search_team_news, arguments)
+        except (SerpApiError, KeyError, OSError, httpx.HTTPError, TimeoutError) as exc:
+            return f"Error calling tool {name}: {exc}"
 
     try:
         result = await mcp_client.call_tool(name, arguments)
@@ -93,7 +204,7 @@ async def chat_turn(
     messages: list[ChatCompletionMessageParam],
     openai_tools: list[ChatCompletionToolParam],
 ) -> str | None:
-    """Run one user turn, including any MCP tool-calling rounds.
+    """Run one user turn, including any local/MCP tool-calling rounds.
 
     Mutates ``messages`` in place. On success, appends the final assistant
     reply and returns its text. On API failure or too many tool rounds, rolls
@@ -160,13 +271,15 @@ async def main() -> None:
     """Connect to the Liga MX MCP server and run the interactive chat loop."""
     async with Client(os.environ["LIGA_MX_MCP_URL"]) as mcp_client:
         list_tools = await mcp_client.list_tools()
-        openai_tools = mcp_tools_to_openai(list_tools.tools)
+        openai_tools = mcp_tools_to_openai(list_tools.tools) + [SEARCH_TEAM_NEWS_TOOL]
         if mcp_client.instructions:
             system_prompt = f"{BASE_SYSTEM_PROMPT}\n\n{mcp_client.instructions}"
         else:
             system_prompt = BASE_SYSTEM_PROMPT
 
         print(f">>> System prompt: {system_prompt}")
+        print(f">>> Local tools: {SEARCH_TEAM_NEWS_TOOL_NAME}")
+        print(f">>> MCP tools: {', '.join(tool.name for tool in list_tools.tools) or '(none)'}")
 
         llm_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
         messages: list[ChatCompletionMessageParam] = [

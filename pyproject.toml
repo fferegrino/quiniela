@@ -5,6 +5,7 @@ description = "Un asistente experto en fútbol mexicano especializado en ayudar 
 readme = "readme.md"
 requires-python = ">=3.10"
 dependencies = [
+    "httpx>=0.28.1",
     "mcp>=2.1.1",
     "mlflow-tracing>=3.16.0",
     "openai>=1.0.0",
