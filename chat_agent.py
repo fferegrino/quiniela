@@ -361,8 +361,8 @@ async def chat_turn(
     """Run one user turn via the Responses API, including tool-calling rounds.
 
     Uses ``previous_response_id`` so reasoning items stay available across
-    function calls. Returns
-    ``(assistant_text, latest_response_id, error, tools_used)``.
+    function calls. Independent tool calls in the same round run concurrently.
+    Returns ``(assistant_text, latest_response_id, error, tools_used)``.
     """
     input_items: ResponseInputParam = [{"role": "user", "content": user_input}]
     response_id = previous_response_id
@@ -388,7 +388,6 @@ async def chat_turn(
         if not function_calls:
             return response.output_text or "", response_id, None, tools_used
 
-        input_items = []
         for tool_call in function_calls:
             try:
                 start_args: dict[str, Any] | None = json.loads(tool_call.arguments or "{}")
@@ -397,7 +396,11 @@ async def chat_turn(
             except json.JSONDecodeError:
                 start_args = None
             _emit(on_tool_event, ToolEvent(name=tool_call.name, phase="start", arguments=start_args))
-            text_result, arguments = await run_tool_call(mcp_client, tool_call)
+
+        results = await asyncio.gather(*(run_tool_call(mcp_client, tool_call) for tool_call in function_calls))
+
+        input_items = []
+        for tool_call, (text_result, arguments) in zip(function_calls, results, strict=True):
             ok = not text_result.startswith("Error")
             usage = ToolUsage(name=tool_call.name, arguments=arguments, ok=ok)
             tools_used.append(usage)
