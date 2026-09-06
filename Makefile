@@ -1,4 +1,4 @@
-.PHONY: format lint check
+.PHONY: format lint check ui cli
 
 format:
 	uv run ruff format .
@@ -11,3 +11,9 @@ lint:
 
 check: lint
 	uv run ruff format --check .
+
+cli:
+	uv run python main.py
+
+ui:
+	uv run streamlit run app.py

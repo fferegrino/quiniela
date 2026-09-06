@@ -10,6 +10,7 @@ dependencies = [
     "mlflow-tracing>=3.16.0",
     "openai>=1.0.0",
     "python-dotenv>=1.0.0",
+    "streamlit>=1.63.0",
 ]
 
 [dependency-groups]
