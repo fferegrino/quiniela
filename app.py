@@ -119,11 +119,18 @@ def main() -> None:
 
     with st.chat_message("assistant"):
         events: queue.Queue[ToolEvent] = queue.Queue()
+        text_deltas: queue.Queue[str] = queue.Queue()
 
         def on_tool_event(event: ToolEvent) -> None:
             events.put(event)
 
-        future = runner.submit(agent.ask(prompt, on_tool_event=on_tool_event))
+        def on_text_delta(delta: str) -> None:
+            text_deltas.put(delta)
+
+        future = runner.submit(agent.ask(prompt, on_tool_event=on_tool_event, on_text_delta=on_text_delta))
+        reply_placeholder = st.empty()
+        streamed_text = ""
+
         with st.status("Pensando…", expanded=True) as status:
             while not future.done():
                 try:
@@ -137,6 +144,13 @@ def main() -> None:
                         else:
                             mark = "✓" if event.ok else "✗"
                             status.write(f"{mark} `{event.name}`")
+                except queue.Empty:
+                    pass
+
+                try:
+                    while True:
+                        streamed_text += text_deltas.get_nowait()
+                        reply_placeholder.markdown(streamed_text)
                 except queue.Empty:
                     pass
                 time.sleep(0.05)
@@ -155,6 +169,12 @@ def main() -> None:
             except queue.Empty:
                 pass
 
+            try:
+                while True:
+                    streamed_text += text_deltas.get_nowait()
+            except queue.Empty:
+                pass
+
             result = future.result()
             if result.tools:
                 status.update(label=f"Listo · {len(result.tools)} herramienta(s)", state="complete")
@@ -166,12 +186,18 @@ def main() -> None:
 
         if result.error:
             error_text = f"Error: {result.error}"
+            reply_placeholder.empty()
             st.error(error_text)
             st.session_state.messages.append({"role": "assistant", "content": error_text, "tools": tools_payload})
         elif result.text:
-            st.markdown(result.text)
-            st.session_state.messages.append({"role": "assistant", "content": result.text, "tools": tools_payload})
+            final_text = result.text
+            reply_placeholder.markdown(final_text)
+            st.session_state.messages.append({"role": "assistant", "content": final_text, "tools": tools_payload})
+        elif streamed_text:
+            reply_placeholder.markdown(streamed_text)
+            st.session_state.messages.append({"role": "assistant", "content": streamed_text, "tools": tools_payload})
         else:
+            reply_placeholder.empty()
             st.warning("No hubo respuesta del modelo.")
 
 

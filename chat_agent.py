@@ -380,11 +380,13 @@ async def chat_turn(
     model: str,
     reasoning_effort: ReasoningEffort,
     on_tool_event: Callable[[ToolEvent], None] | None = None,
+    on_text_delta: Callable[[str], None] | None = None,
 ) -> tuple[str | None, str | None, str | None, list[ToolUsage]]:
     """Run one user turn via the Responses API, including tool-calling rounds.
 
     Uses ``previous_response_id`` so reasoning items stay available across
     function calls. Independent tool calls in the same round run concurrently.
+    When ``on_text_delta`` is set, assistant text is streamed token-by-token.
     Returns ``(assistant_text, latest_response_id, error, tools_used)``.
     """
     input_items: ResponseInputParam = [{"role": "user", "content": user_input}]
@@ -393,7 +395,7 @@ async def chat_turn(
 
     for _ in range(MAX_TOOL_ROUNDS):
         try:
-            response = await llm_client.responses.create(
+            stream = await llm_client.responses.create(
                 model=model,
                 instructions=instructions,
                 input=input_items,
@@ -401,7 +403,19 @@ async def chat_turn(
                 tool_choice="auto",
                 reasoning={"effort": reasoning_effort},
                 previous_response_id=response_id,
+                stream=True,
             )
+            response = None
+            async for event in stream:
+                etype = getattr(event, "type", None)
+                if etype == "response.output_text.delta":
+                    delta = getattr(event, "delta", "") or ""
+                    if delta and on_text_delta is not None:
+                        on_text_delta(delta)
+                elif etype == "response.completed":
+                    response = event.response
+            if response is None:
+                return None, previous_response_id, "Stream ended without a completed response.", tools_used
         except OpenAIError as exc:
             return None, previous_response_id, str(exc), tools_used
 
@@ -555,6 +569,7 @@ class QuinielaAgent:
         user_input: str,
         *,
         on_tool_event: Callable[[ToolEvent], None] | None = None,
+        on_text_delta: Callable[[str], None] | None = None,
     ) -> TurnResult:
         """Send one user message and return the assistant reply (or an error)."""
         if not self._started or self._llm_client is None or self._mcp_client is None:
@@ -574,6 +589,7 @@ class QuinielaAgent:
             self._model,
             self._reasoning_effort,
             on_tool_event=on_tool_event,
+            on_text_delta=on_text_delta,
         )
         return TurnResult(text=reply, error=error, tools=tools)
 
@@ -583,9 +599,10 @@ def ask_sync(
     user_input: str,
     *,
     on_tool_event: Callable[[ToolEvent], None] | None = None,
+    on_text_delta: Callable[[str], None] | None = None,
 ) -> TurnResult:
     """Run ``agent.ask`` from a synchronous host that owns no event loop."""
-    return asyncio.run(agent.ask(user_input, on_tool_event=on_tool_event))
+    return asyncio.run(agent.ask(user_input, on_tool_event=on_tool_event, on_text_delta=on_text_delta))
 
 
 T = TypeVar("T")
