@@ -69,10 +69,22 @@ def get_serpapi_key() -> str:
     raise KeyError("Missing SerpApi key. Set SERP_API_KEY (or SERPAPI_API_KEY / SERPAPI_KEY) in the environment.")
 
 
+# Exclude Liga MX Femenil coverage from team news searches.
+_EXCLUDE_TERMS = ("femenil", "femenino")
+_EXCLUDE_TEXT_RE = re.compile(r"femenil|femenino", re.IGNORECASE)
+
+
 def build_team_query(team: str) -> str:
-    """Build a Google News query focused on a Liga MX club."""
+    """Build a Google News query focused on a Liga MX (men's) club."""
     team = team.strip()
-    return f'"{team}" (Liga MX OR futbol OR fútbol OR soccer)'
+    exclusions = " ".join(f"-{term}" for term in _EXCLUDE_TERMS)
+    return f'"{team}" (Liga MX OR futbol OR fútbol OR soccer) {exclusions}'
+
+
+def _is_femenil_article(title: str, snippet: str | None) -> bool:
+    """Return True when title/snippet look like women's-team coverage."""
+    haystack = title if not snippet else f"{title}\n{snippet}"
+    return bool(_EXCLUDE_TEXT_RE.search(haystack))
 
 
 def when_to_tbs(when: str | None) -> str | None:
@@ -111,14 +123,18 @@ def normalize_news_results(
         link = item.get("link")
         if not title or not link:
             continue
+        title_text = str(title)
+        snippet = str(item["snippet"]) if item.get("snippet") else None
+        if _is_femenil_article(title_text, snippet):
+            continue
         articles.append(
             NewsArticle(
-                title=str(title),
+                title=title_text,
                 link=str(link),
                 source=_source_name(item.get("source")),
                 date=(str(item["date"]) if item.get("date") else None)
                 or (str(item["iso_date"]) if item.get("iso_date") else None),
-                snippet=str(item["snippet"]) if item.get("snippet") else None,
+                snippet=snippet,
                 thumbnail=str(item["thumbnail"]) if item.get("thumbnail") else None,
                 team=team,
             )
