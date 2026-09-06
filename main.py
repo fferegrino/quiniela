@@ -2,12 +2,14 @@ import os
 import sys
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import OpenAI, OpenAIError
 
 load_dotenv()
 
 MODEL = "gpt-4o-mini"
-SYSTEM_PROMPT = """Eres un asistente experto en fútbol mexicano especializado en ayudar a llenar quinielas de la Liga MX."""
+SYSTEM_PROMPT = (
+    """Eres un asistente experto en fútbol mexicano especializado en ayudar a llenar quinielas de la Liga MX."""
+)
 
 
 def main() -> None:
@@ -44,7 +46,7 @@ def main() -> None:
                 model=MODEL,
                 messages=messages,
             )
-        except Exception as exc:
+        except OpenAIError as exc:
             print(f"Error: {exc}")
             messages.pop()
             continue
